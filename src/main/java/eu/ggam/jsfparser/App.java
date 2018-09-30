@@ -1,6 +1,7 @@
 package eu.ggam.jsfparser;
 
 import com.github.javaparser.JavaParser;
+import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.Modifier;
@@ -12,13 +13,19 @@ import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.Expression;
+import com.github.javaparser.ast.expr.NameExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.StringLiteralExpr;
 import com.github.javaparser.ast.stmt.BlockStmt;
+import com.github.javaparser.ast.stmt.ExplicitConstructorInvocationStmt;
 import com.github.javaparser.ast.stmt.Statement;
 import com.github.javaparser.ast.stmt.ThrowStmt;
 import com.github.javaparser.ast.visitor.ModifierVisitor;
 import com.github.javaparser.ast.visitor.Visitable;
+import com.github.javaparser.resolution.UnsolvedSymbolException;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -29,6 +36,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
+import static java.util.stream.Collectors.toList;
 
 /**
  *
@@ -39,11 +47,19 @@ public class App {
     public static void main(String... args) throws IOException {
         String base = "target/classes/mojarra/";
         String dest = "src/main/java/";
+
+        ParserConfiguration parserConfiguration = new ParserConfiguration();
+
+        CombinedTypeSolver localCts = new CombinedTypeSolver();
+
+        parserConfiguration.setSymbolResolver(new JavaSymbolSolver(localCts));
+        JavaParser.setStaticConfiguration(parserConfiguration);
+
         Files.walk(Paths.get(base)).
                 filter(Files::isRegularFile).
                 filter(f -> f.toString().startsWith(base + "javax")).
                 filter(f -> f.toString().endsWith(".java")).
-                forEach(f -> {
+                forEach((Path f) -> {
                     if (f.toString().endsWith("package-info.java")) {
                         return;
                     }
@@ -70,7 +86,7 @@ public class App {
             @Override
             public Node visit(ImportDeclaration n, ClassOrInterfaceDeclaration arg) {
                 String nameAsString = n.getNameAsString();
-                
+
                 if (nameAsString.startsWith("com.sun.")
                         || nameAsString.startsWith("javax.faces.validator.MultiFieldValidationUtils")
                         || nameAsString.startsWith("javax.faces.ServletContextFacesContextFactory")
@@ -114,16 +130,43 @@ public class App {
                             BlockStmt exceptionBlock = getBlock();
 
                             NodeList<Statement> statements = method.getBody().getStatements();
-                            if (!statements.isEmpty()) {
-                                String firstStatement = statements.get(0).toString();
-                                if (firstStatement.contains("super(") || firstStatement.contains("this(")) {
+                            if (!statements.isEmpty() && statements.get(0) instanceof ExplicitConstructorInvocationStmt) {
+                                // There's a super() or this() call. Check if we can change it to default constructor
+                                if (!type.getDefaultConstructor().isPresent() || type.getDefaultConstructor().get().equals(method)) {
+                                    ExplicitConstructorInvocationStmt explicitConstructor = (ExplicitConstructorInvocationStmt) statements.get(0);
+
+                                    NodeList<Expression> arguments = explicitConstructor.getArguments();
+
+                                    NodeList<Expression> newArguments = new NodeList<>(arguments.stream().
+                                            //map(Expression::asNameExpr).
+                                            //map(NameExpr::resolve).
+                                            map(e -> {
+                                                if(!e.isNameExpr()) {
+                                                    return "null";
+                                                }
+                                                
+                                                try {
+                                                    e.asNameExpr().resolve().getType();
+                                                } catch (UnsolvedSymbolException ex) {
+                                                    // Will always fail since no SymbolResolver has been configured.
+                                                    // The exception contains the *unqualified* name of the class
+                                                    return "(" + ex.getName() + ") null";
+                                                }
+                                                throw new RuntimeException("This cannot be reached");
+                                            }).
+                                            map(n -> new NameExpr(n)).
+                                            collect(toList()));
+
+                                    explicitConstructor.setArguments(newArguments);
+
                                     NodeList<Statement> newStatements = new NodeList<>();
-                                    newStatements.add(statements.get(0));
+                                    newStatements.add(explicitConstructor);
                                     newStatements.addAll(exceptionBlock.getStatements());
 
                                     exceptionBlock = new BlockStmt(newStatements);
                                 }
                             }
+
                             method.setBody(exceptionBlock);
                         }
                     }
